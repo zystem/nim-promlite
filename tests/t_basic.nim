@@ -1,15 +1,6 @@
 import std/[math, net, os, osproc, strutils, unittest]
 
 import promlite
-import promlite/gzip
-import promlite/httpserver
-
-proc gunzipWithPython(data: string): string =
-  let path = getTempDir() / "promlite_test.gz"
-  writeFile(path, data)
-  let command = "python3 -c 'import gzip,sys; sys.stdout.buffer.write(gzip.open(sys.argv[1], \"rb\").read())' " & path
-  result = execProcess(command)
-  removeFile(path)
 
 proc checkWithPromtool(metrics: string): bool =
   if findExe("promtool").len == 0:
@@ -38,21 +29,15 @@ proc rawHttpRequest(port: Port; request: string): string =
       break
     result.add(chunk)
 
-proc httpRequest(port: Port; path: string; acceptEncoding = "";
-    httpMethod = "GET"): string =
-  var request = httpMethod & " " & path & " HTTP/1.1\r\n" &
+proc httpRequest(port: Port; path: string; httpMethod = "GET"): string =
+  rawHttpRequest(port, httpMethod & " " & path & " HTTP/1.1\r\n" &
     "Host: 127.0.0.1\r\n" &
-    "Connection: close\r\n"
-  if acceptEncoding.len > 0:
-    request.add("Accept-Encoding: " & acceptEncoding & "\r\n")
-  request.add("\r\n")
-  rawHttpRequest(port, request)
+    "Connection: close\r\n\r\n")
 
-proc waitForHttp(port: Port; path: string; acceptEncoding = "";
-    httpMethod = "GET"): string =
+proc waitForHttp(port: Port; path: string; httpMethod = "GET"): string =
   for _ in 0 ..< 50:
     try:
-      result = httpRequest(port, path, acceptEncoding, httpMethod)
+      result = httpRequest(port, path, httpMethod)
       if result.len > 0:
         return
     except OSError, TimeoutError:
@@ -70,19 +55,10 @@ proc collectTcpMetric(m: var MetricsBuilder) {.gcsafe.} =
   m.help("tcp_metric", "A real TCP test metric")
   m.gauge("tcp_metric", 3)
 
-proc collectTcpGzipMetric(m: var MetricsBuilder) {.gcsafe.} =
-  m.help("tcp_gzip_metric", "A real TCP gzip test metric")
-  m.gauge("tcp_gzip_metric", 5)
-
 proc collectEscapedMetric(m: var MetricsBuilder) {.gcsafe.} =
   m.help("escaped_metric", "slashes \\ and newline\nok")
   m.gauge("escaped_metric", 1,
     labels = {"quote": "a\"b", "slash": "a\\b", "line": "a\nb"})
-
-proc collectLargeMetrics(m: var MetricsBuilder) {.gcsafe.} =
-  m.help("large_series", "Large gzip smoke test series")
-  for i in 0 ..< 10000:
-    m.gauge("large_series", i, labels = {"idx": $i})
 
 proc collectSlowMetric(m: var MetricsBuilder) {.gcsafe.} =
   sleep(1500)
@@ -122,33 +98,31 @@ proc checkValueMetrics(metrics: string) =
   check metrics.contains("value_cache_entries{state=\"warm\",zone=\"a\"} 9\n")
   check checkWithPromtool(metrics)
 
-proc runTcpTestServer(mode: string; port: Port) =
+proc runTcpTestServer(mode: string; port: Port; dataDir: string) =
   let exporter = newExporter(
     address = "127.0.0.1",
     port = int(port),
+    dataDir = dataDir,
     refreshIntervalSeconds = if mode == "slow-start": 60 else: 0,
-    gzipEnabled = mode in ["gzip", "large-gzip", "values-gzip"],
     collector =
       case mode
-      of "gzip": collectTcpGzipMetric
       of "escape": collectEscapedMetric
-      of "large-gzip": collectLargeMetrics
       of "slow-start": collectSlowMetric
-      of "values", "values-gzip": collectValueMetrics
+      of "values": collectValueMetrics
       else: collectTcpMetric
   )
   exporter.run()
 
-proc startTcpTestServer(mode: string; port: Port): Process =
-  startProcess(getAppFilename(), args = ["--tcp-test-server", mode, $int(port)])
+proc startTcpTestServer(mode: string; port: Port; dataDir: string): Process =
+  startProcess(getAppFilename(), args = ["--tcp-test-server", mode, $int(port), dataDir])
 
 proc stopTcpTestServer(process: Process) =
   process.terminate()
   discard process.waitForExit(2000)
   process.close()
 
-if paramCount() == 3 and paramStr(1) == "--tcp-test-server":
-  runTcpTestServer(paramStr(2), Port(parseInt(paramStr(3))))
+if paramCount() == 4 and paramStr(1) == "--tcp-test-server":
+  runTcpTestServer(paramStr(2), Port(parseInt(paramStr(3))), paramStr(4))
   quit(0)
 
 suite "MetricsBuilder":
@@ -182,7 +156,6 @@ suite "MetricsBuilder":
       m.counter("negative_events_total", -1)
     expect ValueError:
       m.counter("negative_float_events_total", -0.5)
-
     m.gauge("same_metric_name", 1)
     expect ValueError:
       m.counter("same_metric_name", 2)
@@ -222,141 +195,88 @@ suite "MetricsBuilder":
     check metrics.contains("repeat_samples{idx=\"first\"} 1\n")
     check metrics.contains("repeat_samples{idx=\"second\"} 2\n")
 
-suite "gzip":
-  test "produces a valid gzip stream":
-    let gz = gzipCompress("example_metric 1\n")
-    check gz.len > 10
-    check gunzipWithPython(gz) == "example_metric 1\n"
+suite "Exporter disk cache":
+  test "creates empty files for darkhttpd on startup":
+    let dataDir = getTempDir() / "promlite-startup-files"
+    removeDir(dataDir)
+    let exporter = newExporter(dataDir = dataDir, collector = proc(m: var MetricsBuilder) = discard)
+    exporter.ensureMetricsFile()
+    check fileExists(dataDir / "metrics")
+    check readFile(dataDir / "metrics") == ""
+    check readFile(dataDir / "healthz") == "ok\n"
+    removeDir(dataDir)
 
-  test "compresses incrementally":
-    var gz = initGzipCompressor()
-    gz.write("# TYPE example_metric gauge\n")
-    gz.write("example_metric 1\n")
-    check gunzipWithPython(gz.finish()) == "# TYPE example_metric gauge\nexample_metric 1\n"
-
-suite "Exporter cache":
-  test "allows disabling forced GC after refresh":
-    let exporter = newExporter(forceGcAfterRefresh = false, collector = proc(m: var MetricsBuilder) =
-      m.gauge("gc_option_metric", 1)
+  test "refresh writes the next metrics file and records its path":
+    let dataDir = getTempDir() / "promlite-refresh-file"
+    removeDir(dataDir)
+    let exporter = newExporter(dataDir = dataDir, forceGcAfterRefresh = false,
+      collector = proc(m: var MetricsBuilder) =
+        m.help("disk_metric", "Disk-backed refresh test metric")
+        m.gauge("disk_metric", 1)
     )
     check exporter.refresh()
     check exporter.isReady()
+    check exporter.cachedResponse().path == dataDir / "metrics"
+    let metrics = readFile(dataDir / "metrics")
+    check metrics.contains("disk_metric 1\n")
+    check checkWithPromtool(metrics)
+    removeDir(dataDir)
 
-  test "refresh swaps cache and preserves previous cache on failure":
-    var fail = false
-    let exporter = newExporter(gzipEnabled = false, collector = proc(m: var MetricsBuilder) =
-      if fail:
-        raise newException(ValueError, "boom")
-      m.gauge("cache_swap_metric", 1)
-    )
-
-    check exporter.refresh()
-    let first = exporter.cachedResponse()
-    check first.body.contains("cache_swap_metric 1\n")
-    fail = true
-    check not exporter.refresh()
-    check exporter.cachedResponse().body == first.body
-
-  test "gzip refresh preserves previous cache on failure":
-    var fail = false
-    let exporter = newExporter(gzipEnabled = true, collector = proc(m: var MetricsBuilder) =
-      if fail:
-        raise newException(ValueError, "boom")
-      m.gauge("gzip_cache_metric", 1)
-    )
-
-    check exporter.refresh()
-    let first = exporter.cachedResponse()
-    check first.compressed
-    check gunzipWithPython(first.body).contains("gzip_cache_metric 1\n")
-    fail = true
-    check not exporter.refresh()
-    check exporter.cachedResponse().body == first.body
-
-  test "gzip refresh discards partially written stream on failure":
+  test "refresh preserves the previous file on failure":
+    let dataDir = getTempDir() / "promlite-refresh-failure"
+    removeDir(dataDir)
     var fail = false
     var value = 1
-    let exporter = newExporter(gzipEnabled = true, collector = proc(m: var MetricsBuilder) =
-      m.gauge("partial_stream_metric", value)
-      if fail:
-        raise newException(ValueError, "boom after partial write")
+    let exporter = newExporter(dataDir = dataDir, forceGcAfterRefresh = false,
+      collector = proc(m: var MetricsBuilder) =
+        m.gauge("partial_stream_metric", value)
+        if fail:
+          raise newException(ValueError, "boom after partial write")
     )
-
     check exporter.refresh()
-    let first = exporter.cachedResponse()
-    check gunzipWithPython(first.body).contains("partial_stream_metric 1\n")
+    let first = readFile(dataDir / "metrics")
     value = 2
     fail = true
     check not exporter.refresh()
-    let afterFailure = exporter.cachedResponse()
-    check afterFailure.body == first.body
-    let metrics = gunzipWithPython(afterFailure.body)
-    check metrics.contains("partial_stream_metric 1\n")
-    check not metrics.contains("partial_stream_metric 2\n")
+    let afterFailure = readFile(dataDir / "metrics")
+    check afterFailure == first
+    check afterFailure.contains("partial_stream_metric 1\n")
+    check not afterFailure.contains("partial_stream_metric 2\n")
+    removeDir(dataDir)
 
 suite "HTTP serving":
-  test "/metrics returns headers and /healthz works":
-    let exporter = newExporter(gzipEnabled = true, collector = proc(m: var MetricsBuilder) =
-      m.gauge("http_metric", 7)
-    )
-    check exporter.refresh()
-
-    let metricsResponse = renderResponse("GET",
-      exporter.handleRequest("GET", "/metrics", "gzip"))
-
-    check metricsResponse.contains("HTTP/1.1 200 OK\r\n")
-    check metricsResponse.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n")
-    check metricsResponse.contains("Content-Encoding: gzip\r\n")
-    check metricsResponse.contains("Content-Length: ")
-
-    let healthResponse = renderResponse("GET",
-      exporter.handleRequest("GET", "/healthz", ""))
-
-    check healthResponse.contains("HTTP/1.1 200 OK\r\n")
-    check healthResponse.endsWith("ok\n")
-
-  test "serves /healthz and /metrics over a real TCP socket":
+  test "serves /healthz and /metrics over darkhttpd":
+    let dataDir = getTempDir() / "promlite-http-plain"
+    removeDir(dataDir)
     let port = freeTcpPort()
-    let process = startTcpTestServer("plain", port)
+    let process = startTcpTestServer("plain", port, dataDir)
     try:
       let healthResponse = waitForHttp(port, "/healthz")
       check healthResponse.contains("HTTP/1.1 200 OK\r\n")
       check healthResponse.endsWith("ok\n")
 
-      let metricsResponse = httpRequest(port, "/metrics")
+      let metricsResponse = waitForHttp(port, "/metrics")
       check metricsResponse.contains("HTTP/1.1 200 OK\r\n")
       check metricsResponse.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n")
-      check responseBody(metricsResponse).contains("tcp_metric 3\n")
-      check checkWithPromtool(responseBody(metricsResponse))
+      let metrics = responseBody(metricsResponse)
+      check metrics.contains("tcp_metric 3\n")
+      check checkWithPromtool(metrics)
 
       let headResponse = httpRequest(port, "/metrics", httpMethod = "HEAD")
       check headResponse.contains("HTTP/1.1 200 OK\r\n")
-      check headResponse.contains("Content-Length: ")
       check responseBody(headResponse).len == 0
-
-      let badResponse = rawHttpRequest(port, "definitely-not-http\r\n\r\n")
-      check badResponse.contains("HTTP/1.1 400 Bad Request\r\n")
-      check badResponse.endsWith("bad request\n")
     finally:
       stopTcpTestServer(process)
+      removeDir(dataDir)
 
-    let gzipPort = freeTcpPort()
-    let gzipProcess = startTcpTestServer("gzip", gzipPort)
-    try:
-      let gzipResponse = waitForHttp(gzipPort, "/metrics", "gzip")
-      check gzipResponse.contains("HTTP/1.1 200 OK\r\n")
-      check gzipResponse.contains("Content-Encoding: gzip\r\n")
-      check gunzipWithPython(responseBody(gzipResponse)).contains("tcp_gzip_metric 5\n")
-    finally:
-      stopTcpTestServer(gzipProcess)
-
-  test "serves escaped HELP and labels over HTTP":
+  test "serves escaped HELP and labels over darkhttpd":
+    let dataDir = getTempDir() / "promlite-http-escape"
+    removeDir(dataDir)
     let port = freeTcpPort()
-    let process = startTcpTestServer("escape", port)
+    let process = startTcpTestServer("escape", port, dataDir)
     try:
       let metricsResponse = waitForHttp(port, "/metrics")
       let metrics = responseBody(metricsResponse)
-
       check metrics.contains("# HELP escaped_metric slashes \\\\ and newline\\nok\n")
       check metrics.contains("quote=\"a\\\"b\"")
       check metrics.contains("slash=\"a\\\\b\"")
@@ -364,18 +284,21 @@ suite "HTTP serving":
       check checkWithPromtool(metrics)
     finally:
       stopTcpTestServer(process)
+      removeDir(dataDir)
 
-  test "binds HTTP server before slow periodic initial refresh completes":
+  test "starts darkhttpd with an empty metrics file before slow refresh completes":
+    let dataDir = getTempDir() / "promlite-http-slow"
+    removeDir(dataDir)
     let port = freeTcpPort()
-    let process = startTcpTestServer("slow-start", port)
+    let process = startTcpTestServer("slow-start", port, dataDir)
     try:
       let healthResponse = waitForHttp(port, "/healthz")
       check healthResponse.contains("HTTP/1.1 200 OK\r\n")
       check healthResponse.endsWith("ok\n")
 
       let warmingMetricsResponse = httpRequest(port, "/metrics")
-      check warmingMetricsResponse.contains("HTTP/1.1 503 Service Unavailable\r\n")
-      check responseBody(warmingMetricsResponse).contains("metrics cache not ready\n")
+      check warmingMetricsResponse.contains("HTTP/1.1 200 OK\r\n")
+      check responseBody(warmingMetricsResponse).len == 0
 
       sleep(1800)
       let readyMetricsResponse = waitForHttp(port, "/metrics")
@@ -383,109 +306,40 @@ suite "HTTP serving":
       check responseBody(readyMetricsResponse).contains("slow_start_metric 1\n")
     finally:
       stopTcpTestServer(process)
+      removeDir(dataDir)
 
-  test "serves a large gzip metrics response over HTTP":
+  test "serves exact metric values for gauges, counters, info, and labels":
+    let dataDir = getTempDir() / "promlite-http-values"
+    removeDir(dataDir)
     let port = freeTcpPort()
-    let process = startTcpTestServer("large-gzip", port)
-    try:
-      let metricsResponse = waitForHttp(port, "/metrics", "gzip")
-      check metricsResponse.contains("HTTP/1.1 200 OK\r\n")
-      check metricsResponse.contains("Content-Encoding: gzip\r\n")
-      let metrics = gunzipWithPython(responseBody(metricsResponse))
-
-      check metrics.contains("large_series{idx=\"0\"} 0\n")
-      check metrics.contains("large_series{idx=\"9999\"} 9999\n")
-      check metrics.count("# TYPE large_series gauge\n") == 1
-      check checkWithPromtool(metrics)
-    finally:
-      stopTcpTestServer(process)
-
-  test "serves exact metric values for gauges, counters, info, and labels over HTTP":
-    let port = freeTcpPort()
-    let process = startTcpTestServer("values", port)
+    let process = startTcpTestServer("values", port, dataDir)
     try:
       let metricsResponse = waitForHttp(port, "/metrics")
       check metricsResponse.contains("HTTP/1.1 200 OK\r\n")
-      let metrics = responseBody(metricsResponse)
-
-      checkValueMetrics(metrics)
+      checkValueMetrics(responseBody(metricsResponse))
     finally:
       stopTcpTestServer(process)
+      removeDir(dataDir)
 
-  test "serves exact metric values for gauges, counters, info, and labels over gzip HTTP":
-    let port = freeTcpPort()
-    let process = startTcpTestServer("values-gzip", port)
-    try:
-      let metricsResponse = waitForHttp(port, "/metrics", "gzip")
-      check metricsResponse.contains("HTTP/1.1 200 OK\r\n")
-      check metricsResponse.contains("Content-Encoding: gzip\r\n")
-      checkValueMetrics(gunzipWithPython(responseBody(metricsResponse)))
-    finally:
-      stopTcpTestServer(process)
-
-  test "honors gzip Accept-Encoding q-values":
-    let exporter = newExporter(gzipEnabled = true, collector = proc(m: var MetricsBuilder) =
-      m.gauge("encoding_metric", 1)
-    )
-    check exporter.refresh()
-
-    check exporter.handleRequest("GET", "/metrics", "br, gzip").status == 200
-    check exporter.handleRequest("GET", "/metrics", "gzip;q=1.0").status == 200
-    check exporter.handleRequest("GET", "/metrics", "gzip; q=0.5").status == 200
-    check exporter.handleRequest("GET", "/metrics", "gzip;q=0").status == 406
-    check exporter.handleRequest("GET", "/metrics", "br, gzip;q=0").status == 406
-    check exporter.handleRequest("GET", "/metrics", "identity").status == 406
-
-  test "serves plaintext metrics when gzip is disabled":
-    let exporter = newExporter(gzipEnabled = false, collector = proc(m: var MetricsBuilder) =
-      m.help("plain_metric", "A plaintext test metric")
-      m.gauge("plain_metric", 9)
-    )
-    check exporter.refresh()
-
-    let response = exporter.handleRequest("GET", "/metrics", "")
-    check response.status == 200
-    check response.contentEncoding == ""
-    check response.body.contains("plain_metric 9\n")
-    check checkWithPromtool(response.body)
-
-  test "handles HEAD, missing cache, methods, and paths":
-    let emptyExporter = newExporter(gzipEnabled = false, collector = proc(m: var MetricsBuilder) =
-      m.gauge("unused_metric", 1)
-    )
-    check emptyExporter.handleRequest("GET", "/metrics", "").status == 503
-    check emptyExporter.handleRequest("POST", "/metrics", "").status == 405
-    check emptyExporter.handleRequest("GET", "/missing", "").status == 404
-    check emptyExporter.handleRequest("GET", "/metrics?foo=bar", "").status == 404
-
-    let exporter = newExporter(gzipEnabled = false, collector = proc(m: var MetricsBuilder) =
-      m.gauge("head_metric", 1)
-    )
-    check exporter.refresh()
-    let headResponse = renderResponse("HEAD",
-      exporter.handleRequest("HEAD", "/metrics", ""))
-    check headResponse.contains("HTTP/1.1 200 OK\r\n")
-    check headResponse.contains("Content-Length: ")
-    check not headResponse.contains("head_metric 1\n")
-
-  test "adds exporter self-metrics for scrapes and refresh failures":
+  test "adds exporter self-metrics for refresh state":
+    let dataDir = getTempDir() / "promlite-self-metrics"
+    removeDir(dataDir)
     var fail = false
-    let exporter = newExporter(gzipEnabled = false, collector = proc(m: var MetricsBuilder) =
-      if fail:
-        raise newException(ValueError, "boom")
-      m.help("app_metric", "An application metric")
-      m.gauge("app_metric", 1)
+    let exporter = newExporter(dataDir = dataDir, forceGcAfterRefresh = false,
+      collector = proc(m: var MetricsBuilder) =
+        if fail:
+          raise newException(ValueError, "boom")
+        m.help("app_metric", "An application metric")
+        m.gauge("app_metric", 1)
     )
-
     check exporter.refresh()
-    discard exporter.handleRequest("GET", "/metrics", "")
     fail = true
     check not exporter.refresh()
     fail = false
     check exporter.refresh()
 
-    let response = exporter.handleRequest("GET", "/metrics", "")
-    check response.body.contains("promlite_cache_ready 1\n")
-    check response.body.contains("promlite_refresh_failures_total 1\n")
-    check response.body.contains("promlite_scrapes_total 1\n")
-    check checkWithPromtool(response.body)
+    let metrics = readFile(dataDir / "metrics")
+    check metrics.contains("promlite_cache_ready 1\n")
+    check metrics.contains("promlite_refresh_failures_total 1\n")
+    check checkWithPromtool(metrics)
+    removeDir(dataDir)

@@ -2,18 +2,18 @@
 
 `promlite` is a small snapshot-oriented Nim package for writing lightweight
 Prometheus exporters. It is designed primarily for long-running exporters that
-collect metrics from external systems, transform them, and expose the latest
-successful snapshot from their own `/metrics` endpoint.
+collect metrics from external systems, transform them, and publish the latest
+successful snapshot as a file served by `darkhttpd`.
 
 Application code only describes metrics. The package handles Prometheus text
-formatting, label escaping, gzip compression, response caching, and the
-`/metrics` and `/healthz` HTTP endpoints.
+formatting, label escaping, atomic file publication, and the `darkhttpd` HTTP
+server that exposes `/metrics` and `/healthz`.
 
 The cache-first design exists for exporters that poll systems such as Harbor,
 cloud APIs, or other services where collection can be slower or less reliable
 than a Prometheus scrape. Instead of pushing processed metrics to Pushgateway,
 the exporter can keep the last successful snapshot in memory and let Prometheus
-scrape it. Real-time metrics are still possible by refreshing the cache on
+scrape it from disk. Real-time metrics are still possible by refreshing the cache on
 demand or very frequently, but that is not the most convenient mode this
 library is optimized for.
 
@@ -31,7 +31,7 @@ on this non-privileged port.
 - strict metric and label name validation
 - non-negative counter validation
 - conflicting metric TYPE detection
-- gzip-compressed cached responses
+- disk-backed cached responses under `/data` by default
 - `/metrics` and `/healthz`
 - optional periodic refresh
 - exporter self-metrics
@@ -42,7 +42,7 @@ framework integration.
 
 ## Install
 
-The package uses `zlib` via Nim's zlib bindings, so a system `zlib` development library is required to build it (for example `zlib` / `zlib-devel`).
+The package vendors `darkhttpd` and compiles it into the exporter binary.
 
 After the package is published to Nimble:
 
@@ -86,38 +86,31 @@ let exporter = newExporter(
 exporter.run()
 ```
 
-`GET /metrics` serves the cached snapshot as gzip when the client sends
-`Accept-Encoding: gzip`, with:
+`GET /metrics` serves the latest successful snapshot from `/data/metrics`, with:
 
 ```http
 Content-Type: text/plain; version=0.0.4; charset=utf-8
-Content-Encoding: gzip
-Content-Length: <compressed length>
+Content-Length: <file length>
 ```
 
 `GET /healthz` returns `ok`.
 
-Only exact endpoint paths are handled. For example, `/metrics?foo=bar` is not a
-Prometheus scrape path and returns `404`.
+`GET /healthz` returns `ok` from `/data/healthz`.
 
 ## Snapshot Model
 
-`promlite` favors fresh metric snapshots and atomic cache replacement over a
+`promlite` favors fresh metric snapshots and atomic file replacement over a
 large persistent metric registry:
 
 1. The collector builds a fresh `MetricsBuilder`.
-2. With gzip enabled, the builder streams Prometheus text fragments directly
-   into zlib while the collector is running.
-3. The compressed response is swapped into the cache.
-4. Scrapes read the cached response without rebuilding metrics.
+2. The final text is written to a temporary file in the data directory.
+3. The temporary file is moved into place as `/data/metrics`.
+4. Scrapes are served by `darkhttpd` from disk without rebuilding metrics.
 
-When `refreshIntervalSeconds > 0`, the HTTP server binds immediately and the
-first refresh runs in a background thread. Until the first successful snapshot
-is ready, `/healthz` returns `ok` and `/metrics` returns `503`.
-
-With gzip enabled, refresh does not keep a full plaintext metrics snapshot in
-memory before compression. The cache still stores the final response snapshot:
-compressed bytes when gzip is enabled, plaintext when gzip is disabled.
+When `refreshIntervalSeconds > 0`, `darkhttpd` starts immediately and the first
+refresh runs in a background thread. Startup always creates at least an empty
+`/data/metrics` file so the HTTP server can serve `/metrics` before the first
+successful refresh.
 
 After every successful refresh, `promlite` runs a forced GC by default:
 
@@ -130,7 +123,7 @@ after refresh is acceptable and releasing memory before the next collection
 cycle matters. Disable it only when GC pause latency matters more than releasing
 memory promptly.
 
-If a refresh fails, the previous successful cached response stays live.
+If a refresh fails, the previous successful metrics file stays live.
 
 ## Examples
 
@@ -143,9 +136,8 @@ Periodic refresh uses a background thread, so compile exporters that set
 
 ## Vendored HTTP Core
 
-The vendored darkhttpd-derived C core lives under `src/promlite/vendor/`.
-It is package-internal plumbing for in-memory HTTP responses and is not exposed
-as the public Nim API.
+The vendored darkhttpd C core lives under `src/promlite/vendor/`. It is
+package-internal HTTP plumbing and serves the data directory from disk.
 
 The public package API intentionally does not expose darkhttpd concepts.
 

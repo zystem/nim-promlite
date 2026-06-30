@@ -1,10 +1,5 @@
 import std/[locks, math, os, strutils, tables, times]
 
-import promlite/gzip
-import promlite/httpserver
-
-export TextContentType
-
 type
   Label* = tuple[name, value: string]
   Collector* = proc(m: var MetricsBuilder) {.gcsafe.}
@@ -12,21 +7,21 @@ type
 
   MetricsBuilder* = object
     text: string
-    compressor: GzipCompressor
-    compressed: bool
+    outFile: File
+    fileBacked: bool
     emittedTypes: Table[string, MetricKind]
     strictNames: bool
 
   CachedResponse* = object
-    body*: string
-    compressed*: bool
+    path*: string
     generatedAtUnix*: int64
 
   Exporter* = ref object
     address: string
     port: int
     refreshIntervalSeconds: int
-    gzipEnabled: bool
+    dataDir: string
+    metricsFileName: string
     forceGcAfterRefresh: bool
     strictNames: bool
     collector: Collector
@@ -36,14 +31,19 @@ type
     lastRefreshUnix: int64
     lastRefreshOk: bool
     refreshFailures: uint64
-    scrapesTotal: uint64
 
 when compileOption("threads"):
   import std/typedthreads
 
 const
   DefaultPort* = 9090
-  MetricsContentType* = TextContentType
+  DefaultDataDir* = "/data"
+  DefaultMetricsFileName* = "metrics"
+  MetricsContentType* = "text/plain; version=0.0.4; charset=utf-8"
+
+{.compile: "promlite/vendor/darkhttpd_promlite.c".}
+
+proc darkhttpdMain(argc: cint; argv: cstringArray): cint {.importc: "promlite_darkhttpd_main".}
 
 proc isValidMetricName*(name: string): bool =
   if name.len == 0:
@@ -87,28 +87,23 @@ proc initMetricsBuilder*(strictNames = true; initialCapacity = 4096): MetricsBui
   result.text = newStringOfCap(initialCapacity)
   result.emittedTypes = initTable[string, MetricKind]()
 
-proc initCompressedMetricsBuilder(strictNames = true): MetricsBuilder =
+proc initFileMetricsBuilder(outFile: File; strictNames = true): MetricsBuilder =
   result.strictNames = strictNames
-  result.compressed = true
-  result.compressor = initGzipCompressor()
+  result.outFile = outFile
+  result.fileBacked = true
   result.emittedTypes = initTable[string, MetricKind]()
 
 proc add(builder: var MetricsBuilder; value: string) =
-  if builder.compressed:
-    builder.compressor.write(value)
+  if builder.fileBacked:
+    builder.outFile.write(value)
   else:
     builder.text.add(value)
 
 proc add(builder: var MetricsBuilder; value: char) =
-  if builder.compressed:
-    var text = newString(1)
-    text[0] = value
-    builder.compressor.write(text)
+  if builder.fileBacked:
+    builder.outFile.write(value)
   else:
     builder.text.add(value)
-
-proc finishCompressed(builder: var MetricsBuilder): string =
-  builder.compressor.finish()
 
 proc requireMetricName(builder: MetricsBuilder; name: string) =
   if builder.strictNames and not isValidMetricName(name):
@@ -200,11 +195,6 @@ proc buildPlaintext*(collector: Collector; strictNames = true): string =
   collector(builder)
   $builder
 
-proc compressedSnapshot*(collector: Collector; strictNames = true): CachedResponse =
-  var builder = initCompressedMetricsBuilder(strictNames)
-  collector(builder)
-  CachedResponse(body: builder.finishCompressed(), compressed: true, generatedAtUnix: epochTime().int64)
-
 proc forceGarbageCollection() =
   when declared(GC_fullCollect):
     GC_fullCollect()
@@ -212,14 +202,16 @@ proc forceGarbageCollection() =
     GC_collect()
 
 proc newExporter*(address = "0.0.0.0"; port = DefaultPort; refreshIntervalSeconds = 0;
-    collector: Collector = nil; gzipEnabled = true; strictNames = true;
+    collector: Collector = nil; dataDir = DefaultDataDir;
+    metricsFileName = DefaultMetricsFileName; strictNames = true;
     forceGcAfterRefresh = true): Exporter =
   new(result)
   result.address = address
   result.port = port
   result.refreshIntervalSeconds = refreshIntervalSeconds
   result.collector = collector
-  result.gzipEnabled = gzipEnabled
+  result.dataDir = dataDir
+  result.metricsFileName = metricsFileName
   result.forceGcAfterRefresh = forceGcAfterRefresh
   result.strictNames = strictNames
   result.lastRefreshOk = false
@@ -230,15 +222,29 @@ proc setCollector*(exporter: Exporter; collector: Collector) =
     exporter.collector = collector
 
 proc selfMetrics(exporter: Exporter; builder: var MetricsBuilder; cacheReady: bool;
-    lastRefreshUnix: int64; refreshFailures, scrapesTotal: uint64) =
+    lastRefreshUnix: int64; refreshFailures: uint64) =
   builder.help("promlite_cache_ready", "Whether the exporter has a cached metrics response")
   builder.gauge("promlite_cache_ready", if cacheReady: 1 else: 0)
   builder.help("promlite_last_refresh_timestamp_seconds", "Unix timestamp of the last successful metrics refresh")
   builder.gauge("promlite_last_refresh_timestamp_seconds", lastRefreshUnix)
   builder.help("promlite_refresh_failures_total", "Total failed metrics refresh attempts")
   builder.counter("promlite_refresh_failures_total", refreshFailures)
-  builder.help("promlite_scrapes_total", "Total /metrics scrape requests handled")
-  builder.counter("promlite_scrapes_total", scrapesTotal)
+
+proc metricsPath*(exporter: Exporter): string = exporter.dataDir / exporter.metricsFileName
+
+proc healthzPath(exporter: Exporter): string = exporter.dataDir / "healthz"
+
+proc ensureMetricsFile*(exporter: Exporter) =
+  createDir(exporter.dataDir)
+  let path = exporter.metricsPath()
+  if not fileExists(path):
+    writeFile(path, "")
+  let healthPath = exporter.healthzPath()
+  if not fileExists(healthPath):
+    writeFile(healthPath, "ok\n")
+
+proc metricsTmpPath(exporter: Exporter): string =
+  exporter.metricsPath() & ".tmp." & $getCurrentProcessId() & "." & $epochTime()
 
 proc refresh*(exporter: Exporter): bool {.discardable.} =
   var collector: Collector
@@ -247,28 +253,27 @@ proc refresh*(exporter: Exporter): bool {.discardable.} =
   if collector.isNil:
     raise newException(ValueError, "collector is not configured")
 
+  var tmpPath = ""
+  var outFile: File
   try:
-    var builder =
-      if exporter.gzipEnabled:
-        initCompressedMetricsBuilder(exporter.strictNames)
-      else:
-        initMetricsBuilder(exporter.strictNames)
+    exporter.ensureMetricsFile()
+    tmpPath = exporter.metricsTmpPath()
+    if not open(outFile, tmpPath, fmWrite):
+      raise newException(IOError, "cannot open metrics temp file: " & tmpPath)
+
+    var builder = initFileMetricsBuilder(outFile, exporter.strictNames)
     collector(builder)
     let generatedAtUnix = epochTime().int64
     var refreshFailures: uint64
-    var scrapesTotal: uint64
     withLock exporter.lock:
       refreshFailures = exporter.refreshFailures
-      scrapesTotal = exporter.scrapesTotal
     exporter.selfMetrics(builder, cacheReady = true, lastRefreshUnix = generatedAtUnix,
-      refreshFailures = refreshFailures, scrapesTotal = scrapesTotal)
-    let body =
-      if exporter.gzipEnabled:
-        builder.finishCompressed()
-      else:
-        $builder
-    let snapshot = CachedResponse(body: body, compressed: exporter.gzipEnabled,
-      generatedAtUnix: generatedAtUnix)
+      refreshFailures = refreshFailures)
+    outFile.flushFile()
+    outFile.close()
+    outFile = nil
+    moveFile(tmpPath, exporter.metricsPath())
+    let snapshot = CachedResponse(path: exporter.metricsPath(), generatedAtUnix: generatedAtUnix)
     withLock exporter.lock:
       exporter.cache = snapshot
       exporter.ready = true
@@ -278,6 +283,10 @@ proc refresh*(exporter: Exporter): bool {.discardable.} =
       forceGarbageCollection()
     true
   except CatchableError:
+    if outFile != nil:
+      outFile.close()
+    if tmpPath.len > 0 and fileExists(tmpPath):
+      removeFile(tmpPath)
     withLock exporter.lock:
       inc exporter.refreshFailures
       exporter.lastRefreshOk = false
@@ -291,54 +300,31 @@ proc isReady*(exporter: Exporter): bool =
   withLock exporter.lock:
     result = exporter.ready
 
-proc acceptsGzip(acceptEncoding: string): bool =
-  for part in acceptEncoding.split(','):
-    let tokens = part.strip().split(';')
-    if tokens.len == 0 or tokens[0].strip().toLowerAscii() != "gzip":
-      continue
-    var quality = 1.0
-    for token in tokens[1 .. ^1]:
-      let param = token.strip()
-      let eq = param.find('=')
-      if eq > 0 and param[0 ..< eq].strip().toLowerAscii() == "q":
-        try:
-          quality = parseFloat(param[eq + 1 .. ^1].strip())
-        except ValueError:
-          quality = 0.0
-    if quality > 0.0:
-      return true
-
-proc handleRequest*(exporter: Exporter; httpMethod, path, acceptEncoding: string): HttpResponse =
-  if httpMethod != "GET" and httpMethod != "HEAD":
-    return HttpResponse(status: 405, contentType: "text/plain", body: "method not allowed\n")
-  if path == "/healthz":
-    return HttpResponse(status: 200, contentType: "text/plain", body: "ok\n")
-  if path != "/metrics":
-    return HttpResponse(status: 404, contentType: "text/plain", body: "not found\n")
-
-  withLock exporter.lock:
-    inc exporter.scrapesTotal
-    if not exporter.ready:
-      return HttpResponse(status: 503, contentType: "text/plain", body: "metrics cache not ready\n")
-    if exporter.cache.compressed and acceptsGzip(acceptEncoding):
-      return HttpResponse(status: 200, contentType: MetricsContentType,
-        contentEncoding: "gzip", body: exporter.cache.body)
-    elif exporter.cache.compressed:
-      return HttpResponse(status: 406, contentType: "text/plain",
-        body: "gzip is required for this cached response\n")
-    else:
-      return HttpResponse(status: 200, contentType: MetricsContentType,
-        body: exporter.cache.body)
-
 when compileOption("threads"):
   proc refreshLoop(exporter: Exporter) {.thread.} =
     while true:
       discard exporter.refresh()
       sleep(exporter.refreshIntervalSeconds * 1000)
 
+  proc darkhttpdLoop(exporter: Exporter) {.thread.} =
+    let portText = $exporter.port
+    var args = allocCStringArray([
+      "darkhttpd",
+      exporter.dataDir,
+      "--addr", exporter.address,
+      "--port", portText,
+      "--no-listing",
+      "--no-keepalive",
+      "--default-mimetype", MetricsContentType,
+      "--header", "Cache-Control: no-store"
+    ])
+    discard darkhttpdMain(12.cint, args)
+    deallocCStringArray(args)
+
 proc start*(exporter: Exporter) =
   if exporter.collector.isNil:
     raise newException(ValueError, "collector is not configured")
+  exporter.ensureMetricsFile()
   if exporter.refreshIntervalSeconds > 0:
     when compileOption("threads"):
       var thread: Thread[Exporter]
@@ -347,8 +333,11 @@ proc start*(exporter: Exporter) =
       raise newException(ValueError, "periodic refresh requires compiling with --threads:on")
   else:
     discard exporter.refresh()
-  runServer(exporter.address, exporter.port,
-    proc(httpMethod, path, acceptEncoding: string): HttpResponse =
-      exporter.handleRequest(httpMethod, path, acceptEncoding))
+  when compileOption("threads"):
+    var httpThread: Thread[Exporter]
+    createThread(httpThread, darkhttpdLoop, exporter)
+    joinThread(httpThread)
+  else:
+    raise newException(ValueError, "darkhttpd serving requires compiling with --threads:on")
 
 proc run*(exporter: Exporter) = exporter.start()
