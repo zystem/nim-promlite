@@ -84,6 +84,11 @@ proc collectLargeMetrics(m: var MetricsBuilder) {.gcsafe.} =
   for i in 0 ..< 10000:
     m.gauge("large_series", i, labels = {"idx": $i})
 
+proc collectSlowMetric(m: var MetricsBuilder) {.gcsafe.} =
+  sleep(1500)
+  m.help("slow_start_metric", "Metric emitted after slow initial refresh")
+  m.gauge("slow_start_metric", 1)
+
 proc collectValueMetrics(m: var MetricsBuilder) {.gcsafe.} =
   m.help("value_temperature_celsius", "Integer gauge")
   m.gauge("value_temperature_celsius", 42)
@@ -121,12 +126,14 @@ proc runTcpTestServer(mode: string; port: Port) =
   let exporter = newExporter(
     address = "127.0.0.1",
     port = int(port),
+    refreshIntervalSeconds = if mode == "slow-start": 60 else: 0,
     gzipEnabled = mode in ["gzip", "large-gzip", "values-gzip"],
     collector =
       case mode
       of "gzip": collectTcpGzipMetric
       of "escape": collectEscapedMetric
       of "large-gzip": collectLargeMetrics
+      of "slow-start": collectSlowMetric
       of "values", "values-gzip": collectValueMetrics
       else: collectTcpMetric
   )
@@ -355,6 +362,25 @@ suite "HTTP serving":
       check metrics.contains("slash=\"a\\\\b\"")
       check metrics.contains("line=\"a\\nb\"")
       check checkWithPromtool(metrics)
+    finally:
+      stopTcpTestServer(process)
+
+  test "binds HTTP server before slow periodic initial refresh completes":
+    let port = freeTcpPort()
+    let process = startTcpTestServer("slow-start", port)
+    try:
+      let healthResponse = waitForHttp(port, "/healthz")
+      check healthResponse.contains("HTTP/1.1 200 OK\r\n")
+      check healthResponse.endsWith("ok\n")
+
+      let warmingMetricsResponse = httpRequest(port, "/metrics")
+      check warmingMetricsResponse.contains("HTTP/1.1 503 Service Unavailable\r\n")
+      check responseBody(warmingMetricsResponse).contains("metrics cache not ready\n")
+
+      sleep(1800)
+      let readyMetricsResponse = waitForHttp(port, "/metrics")
+      check readyMetricsResponse.contains("HTTP/1.1 200 OK\r\n")
+      check responseBody(readyMetricsResponse).contains("slow_start_metric 1\n")
     finally:
       stopTcpTestServer(process)
 

@@ -333,19 +333,20 @@ proc handleRequest*(exporter: Exporter; httpMethod, path, acceptEncoding: string
 when compileOption("threads"):
   proc refreshLoop(exporter: Exporter) {.thread.} =
     while true:
-      sleep(exporter.refreshIntervalSeconds * 1000)
       discard exporter.refresh()
+      sleep(exporter.refreshIntervalSeconds * 1000)
 
 proc start*(exporter: Exporter) =
   if exporter.collector.isNil:
     raise newException(ValueError, "collector is not configured")
-  discard exporter.refresh()
   if exporter.refreshIntervalSeconds > 0:
     when compileOption("threads"):
       var thread: Thread[Exporter]
       createThread(thread, refreshLoop, exporter)
     else:
       raise newException(ValueError, "periodic refresh requires compiling with --threads:on")
+  else:
+    discard exporter.refresh()
   runServer(exporter.address, exporter.port,
     proc(httpMethod, path, acceptEncoding: string): HttpResponse =
       exporter.handleRequest(httpMethod, path, acceptEncoding))

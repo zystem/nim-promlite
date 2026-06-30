@@ -111,6 +111,10 @@ large persistent metric registry:
 3. The compressed response is swapped into the cache.
 4. Scrapes read the cached response without rebuilding metrics.
 
+When `refreshIntervalSeconds > 0`, the HTTP server binds immediately and the
+first refresh runs in a background thread. Until the first successful snapshot
+is ready, `/healthz` returns `ok` and `/metrics` returns `503`.
+
 With gzip enabled, refresh does not keep a full plaintext metrics snapshot in
 memory before compression. The cache still stores the final response snapshot:
 compressed bytes when gzip is enabled, plaintext when gzip is disabled.
