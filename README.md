@@ -40,6 +40,8 @@ framework integration.
 
 ## Install
 
+The package uses `zlib` via Nim's zlib bindings, so a system `zlib` development library is required to build it (for example `zlib` / `zlib-devel`).
+
 After the package is published to Nimble:
 
 ```bash

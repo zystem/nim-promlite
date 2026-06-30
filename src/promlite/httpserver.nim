@@ -15,10 +15,14 @@ type
 proc reason(status: int): string =
   case status
   of 200: "OK"
+  of 400: "Bad Request"
   of 404: "Not Found"
   of 405: "Method Not Allowed"
+  of 406: "Not Acceptable"
+  of 500: "Internal Server Error"
+  of 501: "Not Implemented"
   of 503: "Service Unavailable"
-  else: "OK"
+  else: "Unknown Status"
 
 proc renderResponse*(httpMethod: string; response: HttpResponse): string =
   result = "HTTP/1.1 " & $response.status & " " & reason(response.status) & "\r\n" &

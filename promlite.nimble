@@ -2,6 +2,8 @@ version       = "0.1.0"
 author        = "Andrii Zahriadskyi"
 description   = "Snapshot-oriented library for small long-running Prometheus exporters"
 license       = "MIT"
+gitUrl        = "https://github.com/zystem/nim-promlite.git"
+url           = "https://github.com/zystem/nim-promlite"
 srcDir        = "src"
 skipDirs      = @["tests", "examples"]
 
