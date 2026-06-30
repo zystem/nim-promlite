@@ -29,6 +29,8 @@ on this non-privileged port.
 - HELP and TYPE lines
 - labels and Prometheus label escaping
 - strict metric and label name validation
+- non-negative counter validation
+- conflicting metric TYPE detection
 - gzip-compressed cached responses
 - `/metrics` and `/healthz`
 - optional periodic refresh
@@ -95,16 +97,34 @@ Content-Length: <compressed length>
 
 `GET /healthz` returns `ok`.
 
+Only exact endpoint paths are handled. For example, `/metrics?foo=bar` is not a
+Prometheus scrape path and returns `404`.
+
 ## Snapshot Model
 
 `promlite` favors fresh metric snapshots and atomic cache replacement over a
 large persistent metric registry:
 
 1. The collector builds a fresh `MetricsBuilder`.
-2. `promlite` serializes the builder to Prometheus text format.
-3. The plaintext is gzip-compressed.
-4. The compressed response is swapped into the cache.
-5. Scrapes read the cached response without rebuilding metrics.
+2. With gzip enabled, the builder streams Prometheus text fragments directly
+   into zlib while the collector is running.
+3. The compressed response is swapped into the cache.
+4. Scrapes read the cached response without rebuilding metrics.
+
+With gzip enabled, refresh does not keep a full plaintext metrics snapshot in
+memory before compression. The cache still stores the final response snapshot:
+compressed bytes when gzip is enabled, plaintext when gzip is disabled.
+
+After every successful refresh, `promlite` runs a forced GC by default:
+
+```nim
+forceGcAfterRefresh = true
+```
+
+This default is intentional for long-running exporters where a short pause
+after refresh is acceptable and releasing memory before the next collection
+cycle matters. Disable it only when GC pause latency matters more than releasing
+memory promptly.
 
 If a refresh fails, the previous successful cached response stays live.
 

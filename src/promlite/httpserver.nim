@@ -10,7 +10,7 @@ type
     contentEncoding*: string
     body*: string
 
-  RequestHandler* = proc(httpMethod, path, acceptEncoding: string): HttpResponse
+  RequestHandler* = proc(httpMethod, path, acceptEncoding: string): HttpResponse {.gcsafe.}
 
 proc reason(status: int): string =
   case status
@@ -38,10 +38,7 @@ proc renderResponse*(httpMethod: string; response: HttpResponse): string =
 proc sendResponse(client: Socket; httpMethod: string; response: HttpResponse) =
   client.send(renderResponse(httpMethod, response))
 
-proc parseRequest(raw: string): tuple[httpMethod, path, acceptEncoding: string] =
-  let headerEnd = raw.find("\r\n\r\n")
-  let headerBlock = if headerEnd >= 0: raw[0 ..< headerEnd] else: raw
-  let lines = headerBlock.split("\r\n")
+proc parseRequest(lines: openArray[string]): tuple[httpMethod, path, acceptEncoding: string] =
   if lines.len == 0:
     return
   let first = lines[0].splitWhitespace()
@@ -57,16 +54,18 @@ proc serveOnce*(server: Socket; handler: RequestHandler) =
   var client: Socket
   server.accept(client)
   defer: client.close()
-  var raw = ""
+  var lines: seq[string]
   try:
-    while raw.find("\r\n\r\n") < 0 and raw.len < 8192:
-      let chunk = client.recv(1024, timeout = 1000)
-      if chunk.len == 0:
+    while lines.len < 128:
+      let line = client.recvLine(timeout = 1000, maxLength = 8192)
+      if line.len == 0:
         break
-      raw.add(chunk)
+      if line == "\r\n":
+        break
+      lines.add(line)
   except TimeoutError:
     return
-  let req = parseRequest(raw)
+  let req = parseRequest(lines)
   if req.httpMethod.len == 0:
     client.sendResponse("GET", HttpResponse(status: 400, contentType: "text/plain", body: "bad request\n"))
     return

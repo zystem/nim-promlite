@@ -1,4 +1,4 @@
-import std/[locks, os, sets, strutils, times]
+import std/[locks, math, os, strutils, tables, times]
 
 import promlite/gzip
 import promlite/httpserver
@@ -12,7 +12,9 @@ type
 
   MetricsBuilder* = object
     text: string
-    emittedTypes: HashSet[string]
+    compressor: GzipCompressor
+    compressed: bool
+    emittedTypes: Table[string, MetricKind]
     strictNames: bool
 
   CachedResponse* = object
@@ -25,6 +27,7 @@ type
     port: int
     refreshIntervalSeconds: int
     gzipEnabled: bool
+    forceGcAfterRefresh: bool
     strictNames: bool
     collector: Collector
     lock: Lock
@@ -82,7 +85,30 @@ proc escapeLabelValue*(value: string): string =
 proc initMetricsBuilder*(strictNames = true; initialCapacity = 4096): MetricsBuilder =
   result.strictNames = strictNames
   result.text = newStringOfCap(initialCapacity)
-  result.emittedTypes = initHashSet[string]()
+  result.emittedTypes = initTable[string, MetricKind]()
+
+proc initCompressedMetricsBuilder(strictNames = true): MetricsBuilder =
+  result.strictNames = strictNames
+  result.compressed = true
+  result.compressor = initGzipCompressor()
+  result.emittedTypes = initTable[string, MetricKind]()
+
+proc add(builder: var MetricsBuilder; value: string) =
+  if builder.compressed:
+    builder.compressor.write(value)
+  else:
+    builder.text.add(value)
+
+proc add(builder: var MetricsBuilder; value: char) =
+  if builder.compressed:
+    var text = newString(1)
+    text[0] = value
+    builder.compressor.write(text)
+  else:
+    builder.text.add(value)
+
+proc finishCompressed(builder: var MetricsBuilder): string =
+  builder.compressor.finish()
 
 proc requireMetricName(builder: MetricsBuilder; name: string) =
   if builder.strictNames and not isValidMetricName(name):
@@ -94,53 +120,75 @@ proc requireLabelName(builder: MetricsBuilder; name: string) =
 
 proc help*(builder: var MetricsBuilder; name, doc: string) =
   builder.requireMetricName(name)
-  builder.text.add("# HELP ")
-  builder.text.add(name)
-  builder.text.add(' ')
-  builder.text.add(escapeHelp(doc))
-  builder.text.add('\n')
+  builder.add("# HELP ")
+  builder.add(name)
+  builder.add(' ')
+  builder.add(escapeHelp(doc))
+  builder.add('\n')
 
 proc metricType*(builder: var MetricsBuilder; name: string; kind: MetricKind) =
   builder.requireMetricName(name)
-  if name in builder.emittedTypes:
+  if builder.emittedTypes.hasKey(name):
+    let existingKind = builder.emittedTypes[name]
+    if existingKind != kind:
+      raise newException(ValueError, "conflicting Prometheus metric type for " &
+        name & ": " & $existingKind & " vs " & $kind)
     return
-  builder.emittedTypes.incl(name)
-  builder.text.add("# TYPE ")
-  builder.text.add(name)
-  builder.text.add(' ')
-  builder.text.add($kind)
-  builder.text.add('\n')
+  builder.emittedTypes[name] = kind
+  builder.add("# TYPE ")
+  builder.add(name)
+  builder.add(' ')
+  builder.add($kind)
+  builder.add('\n')
 
 proc appendLabels(builder: var MetricsBuilder; labels: openArray[Label]) =
   if labels.len == 0:
     return
-  builder.text.add('{')
+  builder.add('{')
   for i, label in labels:
     builder.requireLabelName(label.name)
     if i > 0:
-      builder.text.add(',')
-    builder.text.add(label.name)
-    builder.text.add("=\"")
-    builder.text.add(escapeLabelValue(label.value))
-    builder.text.add('"')
-  builder.text.add('}')
+      builder.add(',')
+    builder.add(label.name)
+    builder.add("=\"")
+    builder.add(escapeLabelValue(label.value))
+    builder.add('"')
+  builder.add('}')
 
 proc appendMetric(builder: var MetricsBuilder; name, value: string;
     labels: openArray[Label]; kind: MetricKind) =
   builder.metricType(name, kind)
-  builder.text.add(name)
+  builder.add(name)
   builder.appendLabels(labels)
-  builder.text.add(' ')
-  builder.text.add(value)
-  builder.text.add('\n')
+  builder.add(' ')
+  builder.add(value)
+  builder.add('\n')
+
+proc formatMetricValue(value: SomeNumber): string =
+  when value is SomeFloat:
+    case classify(value)
+    of fcNan: "NaN"
+    of fcInf: "+Inf"
+    of fcNegInf: "-Inf"
+    else: $value
+  else:
+    $value
+
+proc requireCounterValue(value: SomeNumber) =
+  when value is SomeUnsignedInt:
+    discard
+  else:
+    if value < 0:
+      raise newException(ValueError, "Prometheus counter value must be non-negative")
 
 proc gauge*(builder: var MetricsBuilder; name: string; value: SomeNumber;
     labels: openArray[Label] = []) =
-  builder.appendMetric(name, $value, labels, mkGauge)
+  builder.appendMetric(name, formatMetricValue(value), labels, mkGauge)
 
 proc counter*(builder: var MetricsBuilder; name: string; value: SomeNumber;
     labels: openArray[Label] = []) =
-  builder.appendMetric(name, $value, labels, mkCounter)
+  requireCounterValue(value)
+  builder.appendMetric(name, formatMetricValue(value), labels, mkCounter)
 
 proc info*(builder: var MetricsBuilder; name: string; labels: openArray[Label] = []) =
   builder.gauge(name, 1, labels)
@@ -153,17 +201,26 @@ proc buildPlaintext*(collector: Collector; strictNames = true): string =
   $builder
 
 proc compressedSnapshot*(collector: Collector; strictNames = true): CachedResponse =
-  let plain = buildPlaintext(collector, strictNames)
-  CachedResponse(body: gzipCompress(plain), compressed: true, generatedAtUnix: epochTime().int64)
+  var builder = initCompressedMetricsBuilder(strictNames)
+  collector(builder)
+  CachedResponse(body: builder.finishCompressed(), compressed: true, generatedAtUnix: epochTime().int64)
+
+proc forceGarbageCollection() =
+  when declared(GC_fullCollect):
+    GC_fullCollect()
+  elif declared(GC_collect):
+    GC_collect()
 
 proc newExporter*(address = "0.0.0.0"; port = DefaultPort; refreshIntervalSeconds = 0;
-    collector: Collector = nil; gzipEnabled = true; strictNames = true): Exporter =
+    collector: Collector = nil; gzipEnabled = true; strictNames = true;
+    forceGcAfterRefresh = true): Exporter =
   new(result)
   result.address = address
   result.port = port
   result.refreshIntervalSeconds = refreshIntervalSeconds
   result.collector = collector
   result.gzipEnabled = gzipEnabled
+  result.forceGcAfterRefresh = forceGcAfterRefresh
   result.strictNames = strictNames
   result.lastRefreshOk = false
   initLock(result.lock)
@@ -191,7 +248,11 @@ proc refresh*(exporter: Exporter): bool {.discardable.} =
     raise newException(ValueError, "collector is not configured")
 
   try:
-    var builder = initMetricsBuilder(exporter.strictNames)
+    var builder =
+      if exporter.gzipEnabled:
+        initCompressedMetricsBuilder(exporter.strictNames)
+      else:
+        initMetricsBuilder(exporter.strictNames)
     collector(builder)
     let generatedAtUnix = epochTime().int64
     var refreshFailures: uint64
@@ -201,8 +262,11 @@ proc refresh*(exporter: Exporter): bool {.discardable.} =
       scrapesTotal = exporter.scrapesTotal
     exporter.selfMetrics(builder, cacheReady = true, lastRefreshUnix = generatedAtUnix,
       refreshFailures = refreshFailures, scrapesTotal = scrapesTotal)
-    let plain = $builder
-    let body = if exporter.gzipEnabled: gzipCompress(plain) else: plain
+    let body =
+      if exporter.gzipEnabled:
+        builder.finishCompressed()
+      else:
+        $builder
     let snapshot = CachedResponse(body: body, compressed: exporter.gzipEnabled,
       generatedAtUnix: generatedAtUnix)
     withLock exporter.lock:
@@ -210,6 +274,8 @@ proc refresh*(exporter: Exporter): bool {.discardable.} =
       exporter.ready = true
       exporter.lastRefreshUnix = snapshot.generatedAtUnix
       exporter.lastRefreshOk = true
+    if exporter.forceGcAfterRefresh:
+      forceGarbageCollection()
     true
   except CatchableError:
     withLock exporter.lock:
