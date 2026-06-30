@@ -1,4 +1,4 @@
-version       = "0.1.0"
+version       = "0.1.1"
 author        = "Andrii Zahriadskyi"
 description   = "Snapshot-oriented library for small long-running Prometheus exporters"
 license       = "MIT"
